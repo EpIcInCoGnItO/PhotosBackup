@@ -2,8 +2,8 @@ name: Nightly IPA Build
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Auto-runs at midnight UTC
-  workflow_dispatch: # Allows manual triggers
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 jobs:
   build-ipa:
@@ -13,6 +13,12 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
       - name: Select Xcode Version
         uses: maxim-lobanov/setup-xcode@v1
         with:
@@ -20,13 +26,20 @@ jobs:
 
       - name: Build Unsigned App Binary
         run: |
-          xcodebuild -project App/project.yml -scheme PhotosBackup -sdk iphoneos -configuration Release CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO clean build CONFIGURATION_BUILD_DIR=build || \
-          xcodebuild -project PhotosBackup.xcodeproj -scheme PhotosBackup -sdk iphoneos -configuration Release CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO clean build CONFIGURATION_BUILD_DIR=build
+          xcodebuild -project PhotosBackup.xcodeproj \
+            -scheme PhotosBackup \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            clean build \
+            CONFIGURATION_BUILD_DIR=build
 
       - name: Package into IPA
         run: |
           mkdir -p Payload
-          cp -R build/*.app Payload/ 2>/dev/null || cp -R build/Release-iphoneos/*.app Payload/
+          cp -R build/*.app Payload/
           zip -r PhotosBackup-Nightly.ipa Payload
 
       - name: Upload IPA as Build Artifact
