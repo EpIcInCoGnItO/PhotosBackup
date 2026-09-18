@@ -34,10 +34,17 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
     private var watchdog: Timer?
     private var eventsFinished = false
     private var eventsDrainer: (@Sendable () async -> Void)?
+    /// In-memory cache of live upload tasks to bypass expensive cross-process `getAllTasks` IPC.
+    private var activeTasks: [UUID: URLSessionUploadTask] = [:]
     /// Results delivered since iOS last woke the app for this session, for the
     /// summary logged when it finishes delivering them.
     private var deliveredSucceeded = 0
     private var deliveredFailed = 0
+
+    /// A transfer that has moved no bytes for this long is treated as wedged.
+    private static let stallTimeout: TimeInterval = 15 * 60
+    /// Cap individual response body memory retention to prevent jetsam memory kills on error dumps.
+    private static let maxResponseBodySize = 1024 * 1024 // 1 MB limit
 
     private lazy var session: URLSession = {
         let configuration = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
@@ -97,11 +104,6 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
             self.discardAndCancel(transferID: transferID)
         }
     }
-
-    /// A transfer that has moved no bytes for this long is treated as wedged.
-    /// The session's seven-day request timeout plus `waitsForConnectivity`
-    /// means URLSession itself will never give up on it.
-    private static let stallTimeout: TimeInterval = 15 * 60
 
     func cancel(transferID: UUID) async {
         discardAndCancel(transferID: transferID)
@@ -249,6 +251,7 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         progressHandlers[transferID] = nil
         starting.remove(transferID)
         lastProgressAt[transferID] = nil
+        activeTasks[transferID] = nil
         lock.unlock()
         stopWatchdogIfIdle()
     }
@@ -275,14 +278,34 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
     }
 
     private func reconcileOrStart(_ request: URLRequest, file: URL, transferID: UUID) {
+        lock.lock()
+        if let existingTask = activeTasks[transferID] {
+            let shouldDiscard = discarded.contains(transferID)
+            starting.remove(transferID)
+            let reporter = progressHandlers[transferID]
+            lock.unlock()
+
+            if shouldDiscard {
+                existingTask.cancel()
+                return
+            }
+            reporter?(existingTask.countOfBytesSent, max(existingTask.countOfBytesExpectedToSend, existingTask.countOfBytesSent))
+            if existingTask.state == .suspended { existingTask.resume() }
+            DiagnosticEventLog.shared.record("transport", "Reattached to cached active upload task")
+            return
+        }
+        lock.unlock()
+
         session.getAllTasks { [weak self] tasks in
             guard let self else { return }
-            if let task = tasks.first(where: { $0.taskDescription == transferID.uuidString }) {
+            if let task = tasks.first(where: { $0.taskDescription == transferID.uuidString }) as? URLSessionUploadTask {
                 self.lock.lock()
                 let shouldDiscard = self.discarded.contains(transferID)
                 self.starting.remove(transferID)
+                self.activeTasks[transferID] = task
                 let reporter = self.progressHandlers[transferID]
                 self.lock.unlock()
+
                 if shouldDiscard {
                     task.cancel()
                     return
@@ -309,6 +332,7 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
                 ))
                 return
             }
+
             self.lock.lock()
             let wasDiscarded = self.discarded.contains(transferID)
             if wasDiscarded {
@@ -317,16 +341,18 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
             }
             self.lock.unlock()
             guard !wasDiscarded else { return }
-            // Create outside the lock: `uploadTask(with:fromFile:)` must not
-            // run while holding `lock`. `starting` still contains the ID, so a
-            // concurrent cancel either finds this task via `getAllTasks` or
-            // leaves its marker for the re-check below.
+
             let task = self.session.uploadTask(with: request, fromFile: file)
             task.taskDescription = transferID.uuidString
+
             self.lock.lock()
             let racedDiscard = self.discarded.contains(transferID)
             self.starting.remove(transferID)
+            if !racedDiscard {
+                self.activeTasks[transferID] = task
+            }
             self.lock.unlock()
+
             if racedDiscard {
                 task.cancel()
                 return
@@ -336,6 +362,15 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
     }
 
     private func cancelTask(transferID: UUID) {
+        lock.lock()
+        let cachedTask = activeTasks.removeValue(forKey: transferID)
+        lock.unlock()
+
+        if let cachedTask {
+            cachedTask.cancel()
+            return
+        }
+
         session.getAllTasks { [weak self] tasks in
             guard let self else { return }
             if let task = tasks.first(where: { $0.taskDescription == transferID.uuidString }) {
@@ -357,21 +392,15 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         let continuations = waiters.removeValue(forKey: transferID) ?? []
         progressHandlers[transferID] = nil
         lastProgressAt[transferID] = nil
+        activeTasks[transferID] = nil
         lock.unlock()
         stopWatchdogIfIdle()
-        // Checked continuations are not resumed automatically when their Swift
-        // task is cancelled. Always release callers before discarding the URL
-        // session delegate completion, otherwise UploadQueue.running can retain
-        // the worker forever and block every subsequent account.
+
         for continuation in continuations { continuation.resume(throwing: CancellationError()) }
         cancelTask(transferID: transferID)
     }
 
     /// Turn a URL-loading failure into something a failed row can be acted on.
-    /// `localizedDescription` is "unknown error" for `NSURLErrorUnknown`, which
-    /// is exactly the code the Simulator returns for every background-session
-    /// upload — background sessions are not supported there, so a row that says
-    /// only "unknown error" sends you hunting for a bug that is not in the app.
     static func describeFailure(_ detail: String, code: Int?) -> String {
         let vague = detail.isEmpty || detail.localizedCaseInsensitiveContains("unknown error")
         guard vague else { return "Could not reach Google: \(detail)" }
@@ -390,6 +419,7 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         progressHandlers[transferID] = nil
         starting.remove(transferID)
         lastProgressAt[transferID] = nil
+        activeTasks[transferID] = nil
         lock.unlock()
         stopWatchdogIfIdle()
         guard !continuations.isEmpty else { return }
@@ -411,9 +441,18 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
     }
 
     private var resultsDirectory: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PhotosBackup", isDirectory: true)
             .appendingPathComponent("BackgroundUploadResults", isDirectory: true)
+
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            try? FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: url.path
+            )
+        }
+        return url
     }
 
     private func resultURL(for transferID: UUID) -> URL {
@@ -449,16 +488,30 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
         let completions = relaunchCompletions
         relaunchCompletions = []
         lock.unlock()
+
         Task {
+            var bgTaskIdentifier: UIBackgroundTaskIdentifier = .invalid
+            bgTaskIdentifier = await MainActor.run {
+                UIApplication.shared.beginBackgroundTask(withName: "PhotosBackup.BackgroundDrain") {
+                    UIApplication.shared.endBackgroundTask(bgTaskIdentifier)
+                    bgTaskIdentifier = .invalid
+                }
+            }
+
             let started = Date()
             await drainer()
             DiagnosticEventLog.shared.record(
                 "transport",
                 "Handed control back to iOS after \(Int(Date().timeIntervalSince(started).rounded())) s of handling upload results"
             )
-            // iOS may suspend the process as soon as the handler runs.
             DiagnosticEventLog.shared.flush()
-            await MainActor.run { completions.forEach { $0() } }
+
+            await MainActor.run {
+                completions.forEach { $0() }
+                if bgTaskIdentifier != .invalid {
+                    UIApplication.shared.endBackgroundTask(bgTaskIdentifier)
+                }
+            }
         }
     }
 }
@@ -466,8 +519,13 @@ final class BackgroundFileUploadTransport: NSObject, FileUploadTransport, @unche
 extension BackgroundFileUploadTransport: URLSessionDataDelegate, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         lock.lock()
-        responseBodies[dataTask.taskIdentifier, default: Data()].append(data)
-        lock.unlock()
+        defer { lock.unlock() }
+        var body = responseBodies[dataTask.taskIdentifier, default: Data()]
+        if body.count < Self.maxResponseBodySize {
+            let remaining = Self.maxResponseBodySize - body.count
+            body.append(data.prefix(remaining))
+            responseBodies[dataTask.taskIdentifier] = body
+        }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask,
@@ -484,6 +542,7 @@ extension BackgroundFileUploadTransport: URLSessionDataDelegate, URLSessionTaskD
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let value = task.taskDescription, let transferID = UUID(uuidString: value) else { return }
         lock.lock()
+        activeTasks.removeValue(forKey: transferID)
         let body = responseBodies.removeValue(forKey: task.taskIdentifier) ?? Data()
         let shouldDiscard = discarded.remove(transferID) != nil
         lock.unlock()
@@ -506,8 +565,7 @@ extension BackgroundFileUploadTransport: URLSessionDataDelegate, URLSessionTaskD
         lock.lock()
         if succeeded { deliveredSucceeded += 1 } else { deliveredFailed += 1 }
         lock.unlock()
-        // Successes are summarised when iOS finishes delivering; one entry per
-        // photo would crowd a large backup's failures out of the timeline.
+
         if !succeeded, urlError?.code != .cancelled {
             let what = error.map { GPMCError.describeTransport($0) + (urlError.map { " (URLError \($0.errorCode))" } ?? "") }
                 ?? "Google answered HTTP \(http?.statusCode.description ?? "without a status")"
@@ -521,6 +579,7 @@ extension BackgroundFileUploadTransport: URLSessionDataDelegate, URLSessionTaskD
     }
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        failStalledTransfers()
         lock.lock()
         eventsFinished = true
         let succeeded = deliveredSucceeded
@@ -539,9 +598,7 @@ extension BackgroundFileUploadTransport: URLSessionDataDelegate, URLSessionTaskD
 
 final class AppDelegate: NSObject, UIApplicationDelegate {
     /// Not called when iOS merely prewarms the process, so everything recorded
-    /// here describes a real launch. It cannot say which kind: with scenes, the
-    /// application state is still `.background` here even when the user opened
-    /// the app. "Opened the app" or the background run that follows says that.
+    /// here describes a real launch.
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         let version = DiagnosticProcessInfo.appVersion
