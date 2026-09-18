@@ -115,3 +115,31 @@ struct PhotosBackupApp: App {
         }
     }
 }
+
+import SwiftUI
+import UIKit
+
+// 1. Add the AppDelegate class to receive background completion events from iOS
+class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) {
+        // Hands off the completion handler to your BackgroundUploadManager
+        BackgroundUploadManager.shared.backgroundCompletionHandler = completionHandler
+    }
+}
+
+@main
+struct PhotosBackupApp: App {
+    // 2. Attach the AppDelegate to your SwiftUI app
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView() // Or whichever main view your app uses
+        }
+    }
+}
+"Add AppDelegate background URLSession handshake"
